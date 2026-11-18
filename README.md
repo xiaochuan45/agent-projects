@@ -25,7 +25,7 @@ with TemporaryDirectory() as temp:
         manager.update_task(task.number, status="in_progress", codex_session_id="session-123")
 ```
 
-数据库文件由调用方指定，父目录须预先存在。同一数据库应配合同一工作区根目录使用。项目目录须已存在，可传工作区内的相对路径或绝对路径。路径包含 `..`、解析失败或解析后离开工作区时会被拒绝。创建时存储解析后的相对路径，交给执行器前应调用 `project_directory` 重新验证。如果有其他进程能在验证后替换目录，执行器仍需在实际打开目录时实施隔离。
+数据库文件由调用方指定，父目录须预先存在。同一数据库应配合同一工作区根目录使用。项目目录须已存在，可传工作区内的相对路径或绝对路径。路径包含 `..`、解析失败或解析后离开工作区时会被拒绝。工作区根目录和 Git 元数据目录（`.git` 及其子目录）不可注册。项目目录不能相同或互相嵌套，指向同一位置的符号链接也会触发冲突。创建时在同一个 SQLite 写事务中检查冲突并存储解析后的相对路径，交给执行器前应调用 `project_directory` 重新验证。如果有其他进程能在验证后替换目录，执行器仍需在实际打开目录时实施隔离。
 
 ## 模块接口
 
@@ -33,10 +33,10 @@ with TemporaryDirectory() as temp:
 | --- | --- |
 | `ProjectManager(database, workspace)` | 初始化数据库，要求工作区目录已存在 |
 | `create_project(name, directory, *, aliases=(), codex_session_id=None)` | 返回新建的 `Project` |
-| `find_projects(query)` | 返回按编号排序的 `list[Project]`，按编号、名称及别名进行忽略首尾空白与大小写的完整匹配。零条返回空列表，多条全部返回 |
+| `find_projects(query)` | 返回按编号排序的 `list[Project]`，忽略首尾空白与大小写。明确的项目编号仅查询该编号，最多返回一条。其他查询词完整匹配名称和别名，返回全部候选 |
 | `get_project(project_number)` | 按明确编号获取 `Project` |
 | `project_directory(project_number)` | 返回重新验证过的绝对 `Path` |
-| `create_task(project_number, title, *, external_message_id=None, codex_session_id=None)` | 返回 `Task`。相同的非空外部消息 ID 在整个数据库内返回原任务，即使重投时提供了不同项目或标题。省略消息 ID 时每次创建新任务 |
+| `create_task(project_number, title, *, external_message_id=None, codex_session_id=None)` | 返回 `Task`。相同的非空外部消息 ID 在整个数据库内去重。项目编号和去除首尾空白后的标题一致时返回原任务的当前状态。项目或标题不一致时抛出 `ValueError`。省略消息 ID 时每次创建新任务 |
 | `get_task(task_number)` | 按明确编号获取 `Task` |
 | `update_project(project_number, *, status=None, codex_session_id=...)` | 更新并返回 `Project` |
 | `update_task(task_number, *, status=None, codex_session_id=...)` | 更新并返回 `Task` |
@@ -46,7 +46,7 @@ with TemporaryDirectory() as temp:
 ## 数据结构
 
 - `projects` 保存自增 ID、名称、名称查询键、工作区相对路径、状态和可选 Session ID。
-- `project_aliases` 保存项目外键、别名和别名查询键，同一项目内去重，允许不同项目共享别名。
+- `project_aliases` 保存项目外键、别名和别名查询键，同一项目内去重，允许不同项目共享普通别名。编号格式的别名只能使用该项目自己的编号。
 - `tasks` 保存自增 ID、项目外键、标题、状态、可选 Session ID 和可选外部消息 ID。外部消息 ID 有唯一约束，创建在写事务中检查重投并落库。
 
 ## 测试

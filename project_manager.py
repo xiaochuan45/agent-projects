@@ -112,15 +112,39 @@ class ProjectManager:
             raise ValueError("project directory cannot be resolved") from exc
         if not resolved.is_relative_to(self.workspace) or not resolved.is_dir():
             raise ValueError("project directory must be a directory inside the workspace")
+        if (resolved == self.workspace
+                or any(part.casefold() == ".git" for part in path.parts)
+                or any(part.casefold() == ".git"
+                       for part in resolved.relative_to(self.workspace).parts)):
+            raise ValueError("project directory cannot be the workspace root or Git metadata")
         return resolved
+
+    def _check_directory_conflict(self, db, directory, project_id=None):
+        for row in db.execute("SELECT id, directory FROM projects"):
+            if row["id"] == project_id:
+                continue
+            stored = self.workspace / row["directory"]
+            paths = [stored]
+            try:
+                paths.append(self._directory(stored))
+            except ValueError:
+                # Keep the stored path reserved even when it is unavailable.
+                pass
+            if any(directory.is_relative_to(path) or path.is_relative_to(directory)
+                   for path in paths):
+                raise ValueError(f'project directory conflicts with P{row["id"]:03d}')
 
     def project_directory(self, project_number):
         """Resolve and validate the stored directory before handing it to a caller."""
-        return self._directory(self.get_project(project_number).directory)
+        with closing(self._connect()) as db, db:
+            db.execute("BEGIN")
+            row = self._get(db, "projects", _number_id(project_number, "P"))
+            directory = self._directory(row["directory"])
+            self._check_directory_conflict(db, directory, row["id"])
+            return directory
 
     def create_project(self, name, directory, *, aliases=(), codex_session_id=None):
         name = _required(name, "name")
-        directory = self._directory(directory).relative_to(self.workspace).as_posix()
         session = _optional(codex_session_id, "codex_session_id")
         if isinstance(aliases, str):
             raise ValueError("aliases must be an iterable of names")
@@ -129,10 +153,17 @@ class ProjectManager:
             alias = _required(alias, "alias")
             by_key.setdefault(alias.casefold(), alias)
         with self._write() as db:
+            resolved = self._directory(directory)
+            self._check_directory_conflict(db, resolved)
+            relative = resolved.relative_to(self.workspace).as_posix()
             project_id = db.execute(
                 "INSERT INTO projects(name, name_key, directory, codex_session_id)"
-                " VALUES (?, ?, ?, ?)", (name, name.casefold(), directory, session)
+                " VALUES (?, ?, ?, ?)", (name, name.casefold(), relative, session)
             ).lastrowid
+            for alias in by_key.values():
+                alias_id = _number_id(alias, "P")
+                if alias_id is not None and alias_id != project_id:
+                    raise ValueError("alias cannot be another project number")
             db.executemany(
                 "INSERT INTO project_aliases(project_id, alias, alias_key) VALUES (?, ?, ?)",
                 ((project_id, alias, key) for key, alias in by_key.items()),
@@ -144,13 +175,17 @@ class ProjectManager:
         key = query.casefold()
         with closing(self._connect()) as db, db:
             db.execute("BEGIN")
+            project_id = _number_id(query, "P")
+            if project_id is not None:
+                row = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+                return [] if row is None else [self._project(db, row)]
             rows = db.execute(
                 """SELECT * FROM projects
-                   WHERE id = ? OR name_key = ? OR id IN (
+                   WHERE name_key = ? OR id IN (
                        SELECT project_id FROM project_aliases WHERE alias_key = ?
                    )
                    ORDER BY id""",
-                (_number_id(query, "P"), key, key),
+                (key, key),
             ).fetchall()
             return [self._project(db, row) for row in rows]
 
@@ -161,16 +196,19 @@ class ProjectManager:
 
     def create_task(self, project_number, title, *, external_message_id=None, codex_session_id=None):
         message_id = _optional(external_message_id, "external_message_id")
+        project_id = _number_id(project_number, "P")
+        title = _required(title, "title")
+        session = _optional(codex_session_id, "codex_session_id")
         with self._write() as db:
             if message_id is not None:
                 existing = db.execute(
                     "SELECT * FROM tasks WHERE external_message_id = ?", (message_id,)
                 ).fetchone()
                 if existing is not None:
+                    if existing["project_id"] != project_id or existing["title"] != title:
+                        raise ValueError("external message ID conflicts with an existing task")
                     return self._task(existing)
-            project_id = self._get(db, "projects", _number_id(project_number, "P"))["id"]
-            title = _required(title, "title")
-            session = _optional(codex_session_id, "codex_session_id")
+            self._get(db, "projects", project_id)
             task_id = db.execute(
                 "INSERT INTO tasks(project_id, title, external_message_id, codex_session_id)"
                 " VALUES (?, ?, ?, ?)", (project_id, title, message_id, session)
