@@ -1,5 +1,6 @@
 """SQLite-backed project and task management."""
 
+import re
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -81,6 +82,11 @@ def _number_id(number, prefix):
     return None
 
 
+def _check_project_name(name):
+    if re.fullmatch(r"[pt][0-9]+", name.casefold()):
+        raise ValueError("project name is a reserved system number")
+
+
 class ProjectManager:
     def __init__(self, database, workspace):
         self.database = Path(database).absolute()
@@ -153,41 +159,48 @@ class ProjectManager:
             alias = _required(alias, "alias")
             by_key.setdefault(alias.casefold(), alias)
         with self._write() as db:
-            resolved = self._directory(directory)
-            self._check_directory_conflict(db, resolved)
-            relative = resolved.relative_to(self.workspace).as_posix()
-            project_id = db.execute(
-                "INSERT INTO projects(name, name_key, directory, codex_session_id)"
-                " VALUES (?, ?, ?, ?)", (name, name.casefold(), relative, session)
-            ).lastrowid
-            for alias in by_key.values():
-                alias_id = _number_id(alias, "P")
-                if alias_id is not None and alias_id != project_id:
-                    raise ValueError("alias cannot be another project number")
-            db.executemany(
-                "INSERT INTO project_aliases(project_id, alias, alias_key) VALUES (?, ?, ?)",
-                ((project_id, alias, key) for key, alias in by_key.items()),
-            )
-            return self._project(db, self._get(db, "projects", project_id))
+            return self._create_project(db, name, directory, by_key, session)
+
+    def _create_project(self, db, name, directory, by_key, session):
+        _check_project_name(name)
+        resolved = self._directory(directory)
+        self._check_directory_conflict(db, resolved)
+        relative = resolved.relative_to(self.workspace).as_posix()
+        project_id = db.execute(
+            "INSERT INTO projects(name, name_key, directory, codex_session_id)"
+            " VALUES (?, ?, ?, ?)", (name, name.casefold(), relative, session)
+        ).lastrowid
+        for alias in by_key.values():
+            alias_id = _number_id(alias, "P")
+            if alias_id is not None and alias_id != project_id:
+                raise ValueError("alias cannot be another project number")
+        db.executemany(
+            "INSERT INTO project_aliases(project_id, alias, alias_key) VALUES (?, ?, ?)",
+            ((project_id, alias, key) for key, alias in by_key.items()),
+        )
+        return self._project(db, self._get(db, "projects", project_id))
 
     def find_projects(self, query):
         query = _required(query, "query")
-        key = query.casefold()
         with closing(self._connect()) as db, db:
             db.execute("BEGIN")
-            project_id = _number_id(query, "P")
-            if project_id is not None:
-                row = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-                return [] if row is None else [self._project(db, row)]
-            rows = db.execute(
-                """SELECT * FROM projects
-                   WHERE name_key = ? OR id IN (
-                       SELECT project_id FROM project_aliases WHERE alias_key = ?
-                   )
-                   ORDER BY id""",
-                (key, key),
-            ).fetchall()
-            return [self._project(db, row) for row in rows]
+            return self._find_projects(db, query)
+
+    def _find_projects(self, db, query):
+        key = query.casefold()
+        project_id = _number_id(query, "P")
+        if project_id is not None:
+            row = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            return [] if row is None else [self._project(db, row)]
+        rows = db.execute(
+            """SELECT * FROM projects
+               WHERE name_key = ? OR id IN (
+                   SELECT project_id FROM project_aliases WHERE alias_key = ?
+               )
+               ORDER BY id""",
+            (key, key),
+        ).fetchall()
+        return [self._project(db, row) for row in rows]
 
     def get_project(self, project_number):
         with closing(self._connect()) as db, db:
@@ -209,11 +222,42 @@ class ProjectManager:
                         raise ValueError("external message ID conflicts with an existing task")
                     return self._task(existing)
             self._get(db, "projects", project_id)
-            task_id = db.execute(
-                "INSERT INTO tasks(project_id, title, external_message_id, codex_session_id)"
-                " VALUES (?, ?, ?, ?)", (project_id, title, message_id, session)
-            ).lastrowid
-            return self._task(self._get(db, "tasks", task_id))
+            return self._insert_task(db, project_id, title, message_id, session)
+
+    def _insert_task(self, db, project_id, title, message_id, session=None):
+        task_id = db.execute(
+            "INSERT INTO tasks(project_id, title, external_message_id, codex_session_id)"
+            " VALUES (?, ?, ?, ?)", (project_id, title, message_id, session)
+        ).lastrowid
+        return self._task(self._get(db, "tasks", task_id))
+
+    def register_message_task(self, project_query, title, *, external_message_id,
+                              new_directory=None):
+        """Resolve or create a project and register one external message atomically."""
+        query = _required(project_query, "project_query")
+        title = _required(title, "title")
+        message_id = _required(external_message_id, "external_message_id")
+        with self._write() as db:
+            existing = db.execute(
+                "SELECT * FROM tasks WHERE external_message_id = ?", (message_id,)
+            ).fetchone()
+            if existing is not None:
+                return "duplicate", self._task(existing), []
+
+            if new_directory is not None:
+                _check_project_name(query)
+            candidates = self._find_projects(db, query)
+            if new_directory is not None:
+                if candidates:
+                    return "clarification_required", None, candidates
+                project = self._create_project(db, query, new_directory, {}, None)
+            elif len(candidates) == 1:
+                project = candidates[0]
+            else:
+                return "clarification_required", None, candidates
+
+            task = self._insert_task(db, _number_id(project.number, "P"), title, message_id)
+            return "registered", task, []
 
     def get_task(self, task_number):
         with closing(self._connect()) as db:

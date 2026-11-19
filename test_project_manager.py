@@ -44,12 +44,15 @@ class ProjectManagerTests(unittest.TestCase):
         self.assertEqual(self.manager.find_projects("P9223372036854775808"), [])
 
     def test_project_number_takes_precedence_and_alias_cannot_claim_another_number(self):
-        first = self.manager.create_project("P002", "app", aliases=["p001"])
+        for name in ("P001", " p002 ", "T003", "P1000"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "reserved"):
+                self.manager.create_project(name, "app")
+        first = self.manager.create_project("Alpha", "app", aliases=["p001"])
         self.assertEqual(self.manager.find_projects("P002"), [])
         for alias in (" p001 ", "P003"):
             with self.subTest(alias=alias), self.assertRaisesRegex(ValueError, "alias"):
                 self.manager.create_project("Beta", "app-other", aliases=[alias])
-        second = self.manager.create_project("P001", "app-other")
+        second = self.manager.create_project("Beta", "app-other")
         self.assertEqual(second.number, "P002")
         self.assertEqual(self.manager.find_projects(" P001 "), [first])
         self.assertEqual(self.manager.find_projects("p002"), [second])
