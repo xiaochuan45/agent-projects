@@ -18,7 +18,7 @@ def valid_message_id(value):
 class FeishuMessageReceiver:
     """Accept events only from a trusted SDK or local lark-cli consumer."""
 
-    def __init__(self, manager, *, allowed_open_id, namespace):
+    def __init__(self, manager, *, allowed_open_id, namespace, natural_router=None):
         if not isinstance(allowed_open_id, str) or not re.fullmatch(
             r"ou_[A-Za-z0-9_-]+", allowed_open_id
         ):
@@ -30,6 +30,7 @@ class FeishuMessageReceiver:
         self.manager = manager
         self.allowed_open_id = allowed_open_id
         self.namespace = namespace
+        self.natural_router = natural_router
 
     def authorized_message(self, payload):
         """Return the message and envelope format if it passes the sender and chat checks."""
@@ -77,7 +78,16 @@ class FeishuMessageReceiver:
 
         command = content.strip().split("\n", 1)
         action = command[0].strip()
-        if len(command) != 2 or action not in ("任务", "新建项目"):
+        if action not in ("任务", "新建项目"):
+            if self.natural_router is not None:
+                try:
+                    return self.natural_router.route(
+                        content.strip(), self.namespace, self.allowed_open_id, message_id
+                    )
+                except ValueError:
+                    return {"status": "invalid_natural_text"}
+            return {"status": "invalid", "reason": "invalid_command"}
+        if len(command) != 2:
             return {"status": "invalid", "reason": "invalid_command"}
         new_project = action == "新建项目"
         fields = [field.strip() for field in command[1].split("\n", 2 if new_project else 1)]
@@ -89,6 +99,7 @@ class FeishuMessageReceiver:
                 fields[0], fields[-1],
                 new_directory=fields[1] if new_project else None,
                 external_message_id=f"feishu:{self.namespace}:{message_id}",
+                confirmed_scope=(self.namespace, self.allowed_open_id),
             )
         except ValueError as exc:
             return {"status": "invalid", "reason": str(exc)}

@@ -14,6 +14,7 @@ from contextlib import closing
 from pathlib import Path
 
 from feishu_receiver import MESSAGE_EVENT, FeishuMessageReceiver, valid_message_id
+from natural_language_router import NaturalLanguageRouter
 from project_manager import ProjectManager
 
 
@@ -41,10 +42,29 @@ def receipt_text(result):
         return f'已登记。项目 {result["project_number"]}，任务 {result["task_number"]}。'
     if result["status"] == "clarification_required":
         candidates = result["candidates"]
+        if "request_id" in result:
+            request_id = result["request_id"]
+            if not result["can_confirm"]:
+                return "请补充具体开发任务和项目名称，然后重新发送完整需求。"
+            options = "、".join(f'{p["project_number"]}（{p["name"][:120]}）'
+                               for p in candidates[:20])
+            prompt = f"请选择项目。候选项目为 {options}。" if options else "请核对项目归属。"
+            prompt += f" 回复「确认 {request_id} 项目编号」以登记原任务。"
+            if result["allow_new"]:
+                prompt += f" 如需新建，请回复「确认 {request_id} 新建 项目名称」。"
+            return prompt
         if not candidates:
             return "未找到项目。请核对项目编号、名称或别名，或使用「新建项目」。"
         numbers = "、".join(project["project_number"] for project in candidates[:20])
         return f"请使用明确的项目编号重新发送任务。候选编号（最多 20 个）为 {numbers}。"
+    natural_errors = {
+        "classification_failed": "暂时无法识别需求。请重新发送完整需求或使用固定格式。",
+        "unsupported": "这条消息未识别为开发需求。请说明要开发的功能和所属项目。",
+        "invalid_confirmation": "无法确认该请求。请检查原回执中的请求编号和项目选项。",
+        "invalid_natural_text": "需求文本无效。请检查项目名称和任务内容后重新发送。",
+    }
+    if result["status"] in natural_errors:
+        return natural_errors[result["status"]]
     return (
         "登记失败。请核对命令、项目名称、目录和任务内容。\n"
         "已有项目格式为「任务 / 项目 / 内容」。\n"
@@ -53,13 +73,19 @@ def receipt_text(result):
 
 
 class LiveBridge:
-    def __init__(self, manager, open_ids, namespace, cli=("lark-cli",)):
+    def __init__(self, manager, open_ids, namespace, cli=("lark-cli",), *,
+                 natural_language_enabled=False, classifier=None):
         self.manager = manager
         self.namespace = namespace
         self.cli = cli
         self.stopping = False
+        if natural_language_enabled and classifier is None:
+            raise ValueError("natural language routing requires an injected classifier")
+        router = NaturalLanguageRouter(manager, classifier) if natural_language_enabled else None
         self.receivers = {
-            open_id: FeishuMessageReceiver(manager, allowed_open_id=open_id, namespace=namespace)
+            open_id: FeishuMessageReceiver(
+                manager, allowed_open_id=open_id, namespace=namespace, natural_router=router
+            )
             for open_id in open_ids
         }
         with closing(sqlite3.connect(self.manager.database)) as db, db:
@@ -95,7 +121,7 @@ class LiveBridge:
                     return 0
             result = receiver.handle_event(payload)
             return self.send_receipt(recipient, key, receipt_text(result))
-        except (sqlite3.Error, UnicodeError):
+        except (OSError, sqlite3.Error, UnicodeError):
             LOG.error("Could not process Feishu event")
             return 1
 
@@ -211,7 +237,7 @@ class LiveBridge:
         return 0 if self.stopping else 1
 
 
-def main():
+def main(*, classifier=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="exit after one eligible message")
     parser.add_argument("--timeout", type=int, default=120,
@@ -225,7 +251,15 @@ def main():
         workspace = Path(os.environ["FEISHU_WORKSPACE"]).expanduser()
         namespace = os.environ["FEISHU_NAMESPACE"]
         open_ids = [value.strip() for value in os.environ["FEISHU_ALLOWED_OPEN_IDS"].split(",")]
-        bridge = LiveBridge(ProjectManager(database, workspace), open_ids, namespace)
+        natural_language_enabled = os.environ.get("FEISHU_NATURAL_LANGUAGE_ENABLED", "0")
+        if natural_language_enabled not in ("0", "1"):
+            raise ValueError("FEISHU_NATURAL_LANGUAGE_ENABLED must be 0 or 1")
+        if natural_language_enabled == "1" and classifier is None:
+            raise ValueError("natural language routing requires an injected classifier")
+        bridge = LiveBridge(
+            ProjectManager(database, workspace), open_ids, namespace,
+            natural_language_enabled=natural_language_enabled == "1", classifier=classifier,
+        )
     except KeyError as exc:
         parser.error(f"missing environment variable {exc.args[0]}")
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:

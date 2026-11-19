@@ -1,11 +1,13 @@
 """SQLite-backed project and task management."""
 
+import os
 import re
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 
 STATUSES = ("pending", "in_progress", "completed", "cancelled")
@@ -37,6 +39,19 @@ CREATE TABLE IF NOT EXISTS tasks (
         CHECK (status IN ('pending', 'in_progress', 'completed', 'cancelled')),
     codex_session_id TEXT,
     external_message_id TEXT UNIQUE
+);
+CREATE TABLE IF NOT EXISTS feishu_project_context (
+    namespace TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    PRIMARY KEY (namespace, sender)
+);
+CREATE TABLE IF NOT EXISTS feishu_natural_messages (
+    message_id TEXT PRIMARY KEY,
+    namespace TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    result TEXT NOT NULL,
+    pending_title TEXT
 );
 """
 
@@ -202,6 +217,91 @@ class ProjectManager:
         ).fetchall()
         return [self._project(db, row) for row in rows]
 
+    def _list_projects(self, db):
+        return [self._project(db, row) for row in db.execute("SELECT * FROM projects ORDER BY id")]
+
+    def _message_task(self, db, message_id):
+        row = db.execute(
+            "SELECT * FROM tasks WHERE external_message_id = ?", (message_id,)
+        ).fetchone()
+        return None if row is None else self._task(row)
+
+    @staticmethod
+    def _confirmed_project(db, scope):
+        row = db.execute(
+            "SELECT project_id FROM feishu_project_context WHERE namespace = ? AND sender = ?",
+            scope,
+        ).fetchone()
+        return None if row is None else f'P{row["project_id"]:03d}'
+
+    @staticmethod
+    def _remember_project(db, scope, project_id):
+        db.execute(
+            """INSERT INTO feishu_project_context VALUES (?, ?, ?)
+               ON CONFLICT(namespace, sender) DO UPDATE SET project_id = excluded.project_id""",
+            (*scope, project_id),
+        )
+
+    @contextmanager
+    def _directory_transaction(self):
+        """Keep the directory on commit and remove our empty directory on rollback."""
+        root_fd = None
+        created = None
+
+        def allocate():
+            nonlocal root_fd, created
+            root_fd = os.open(self.workspace, os.O_DIRECTORY | os.O_NOFOLLOW)
+            for _ in range(10):
+                name = f"project-{uuid4().hex}"
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=root_fd)
+                except FileExistsError:
+                    continue
+                created = (name, os.stat(name, dir_fd=root_fd, follow_symlinks=False))
+                return name
+            raise FileExistsError("could not allocate a unique project directory")
+
+        try:
+            with self._write() as db:
+                yield db, allocate
+                if created is not None:
+                    name, original = created
+                    current = os.lstat(self.workspace / name)
+                    if (not os.path.samestat(original, current)
+                            or not os.path.samestat(os.fstat(root_fd), os.lstat(self.workspace))):
+                        raise ValueError("allocated directory or workspace changed")
+                    os.fsync(root_fd)
+        except BaseException:
+            if created is not None:
+                name, original = created
+                try:
+                    current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                    if os.path.samestat(original, current):
+                        os.rmdir(name, dir_fd=root_fd)
+                        os.fsync(root_fd)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+
+    def _create_allocated_project(self, db, allocate, name):
+        _check_project_name(name)
+        directory = allocate()
+        project = self._create_project(db, name, directory, {}, None)
+        if project.directory != directory or (self.workspace / directory).is_symlink():
+            raise ValueError("allocated project directory changed")
+        return project
+
+    def _register_project_task(self, db, project_number, title, message_id, scope=None):
+        project_id = _number_id(project_number, "P")
+        self._get(db, "projects", project_id)
+        task = self._insert_task(db, project_id, title, message_id)
+        if scope is not None:
+            self._remember_project(db, scope, project_id)
+        return task
+
     def get_project(self, project_number):
         with closing(self._connect()) as db, db:
             db.execute("BEGIN")
@@ -232,17 +332,15 @@ class ProjectManager:
         return self._task(self._get(db, "tasks", task_id))
 
     def register_message_task(self, project_query, title, *, external_message_id,
-                              new_directory=None):
+                              new_directory=None, confirmed_scope=None):
         """Resolve or create a project and register one external message atomically."""
         query = _required(project_query, "project_query")
         title = _required(title, "title")
         message_id = _required(external_message_id, "external_message_id")
         with self._write() as db:
-            existing = db.execute(
-                "SELECT * FROM tasks WHERE external_message_id = ?", (message_id,)
-            ).fetchone()
+            existing = self._message_task(db, message_id)
             if existing is not None:
-                return "duplicate", self._task(existing), []
+                return "duplicate", existing, []
 
             if new_directory is not None:
                 _check_project_name(query)
@@ -256,7 +354,7 @@ class ProjectManager:
             else:
                 return "clarification_required", None, candidates
 
-            task = self._insert_task(db, _number_id(project.number, "P"), title, message_id)
+            task = self._register_project_task(db, project.number, title, message_id, confirmed_scope)
             return "registered", task, []
 
     def get_task(self, task_number):
