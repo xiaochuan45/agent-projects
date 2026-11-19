@@ -84,18 +84,28 @@ app
 | `ignored` | 事件类型、发件人、会话或消息类型不符合条件 |
 | `invalid` | 消息 ID、文本、命令、项目名称或路径无效，包含 `reason` |
 
-去重记录随已登记任务持久化。澄清和无效输入无需写入项目库。
+任务去重键随已登记任务持久化。澄清和无效输入不会创建项目或任务。
+
+### 实时接单与单次联调
+
+`feishu_live_bridge.py` 通过本机 `lark-cli event consume im.message.receive_v1 --as bot` 订阅消息。它保持子进程 stdin 开启，等 stderr 出现该事件的就绪标记后读取 stdout NDJSON，并继续排空 stderr。启动等待上限为 30 秒。消费者退出后按 2、4、8 秒递增退避，最多等待 60 秒，一次运行满 60 秒后恢复初始间隔。收到 SIGTERM 或 Ctrl+C 时停止接收，等待正在处理的事件，再关闭消费者 stdin 并回收进程。
+
+接单桥从环境读取逗号分隔的 Open ID 白名单，每位授权用户使用同一个项目库。它将授权的单聊文本交给 `FeishuMessageReceiver` 登记，再用 `lark-cli im +messages-send --as bot --user-id …` 私聊发送项目编号和任务编号，或发送格式错误与项目澄清提示。已确认发送的回执在同一 SQLite 库中保存成功标记，重投时直接跳过。发送失败时保留已登记任务，原事件重投会复用任务编号和回执幂等键。接单桥没有后台回执补发队列，错误提示后应按提示发一条新消息。
+
+手动联调前，在测试应用启用机器人和 `im.message.receive_v1` 长连接订阅，确认有读私聊权限 `im:message.p2p_msg:readonly` 和机器人发送权限 `im:message:send_as_bot`。用已配置该应用的本机 CLI 账户运行以下命令，替换占位值。数据库父目录、工作区和待注册的项目目录须已存在。数据库必须位于 Git 仓库之外。`FEISHU_NAMESPACE` 请为同一应用和租户保持固定。
+
+```bash
+FEISHU_DB_PATH='/已有的仓库外目录/projects.sqlite3' \
+FEISHU_WORKSPACE='/已有的工作区' \
+FEISHU_ALLOWED_OPEN_IDS='ou_REPLACE_WITH_TEST_OPEN_ID' \
+FEISHU_NAMESPACE='test-app.test-tenant' \
+python3 -B feishu_live_bridge.py --once --timeout 120
+```
+
+等日志出现 `Feishu consumer ready` 后，按上文格式给测试机器人发一条私聊。单次模式跳过无关事件，处理第一条符合身份、会话、类型及消息 ID 校验的消息后退出。收到业务错误提示也算完成一次处理。发送失败或等待超时返回 1，配置错误返回 2。等待期限以开始接单为止，进行中的发送和进程回收另有各自的超时。
 
 ### 与 Autoloop 审批共存
 
-本机 v1.9.2 的 `plugins/feishu/channel.ts` 使用 `lark-cli event consume card.action.trigger --as bot`，将卡片点击交给审批流程。`docs/plugins.md` 和 `docs/protocol.md` 定义的 `source.ts` 是同步 HTTP Webhook 转换器，入口为 `/v1/in/<来源>`，没有长连接消息钩子。`/v1/events` 可接收外部来源提交的标准事件。
+本机 Autoloop v1.9.2 的 `plugins/feishu/channel.ts` 用独立子进程消费 `card.action.trigger --as bot`，将卡片点击交给原审批流程。lark-cli 1.0.100 的本机文档说明每个消费者订阅一个 EventKey，多个消费者可以共用同一个本地事件总线 daemon。接单桥只订阅 `im.message.receive_v1`，停止时只关闭自己的消费者。部署时应以同一主机、运行用户和 CLI 应用上下文启动两个消费者。
 
-本机 lark-cli 1.0.100 的 `event consume --help` 和 `skills read lark-event` 说明每个消费者订阅一个 EventKey，多个本地消费者可共享事件总线 daemon。上线方案是在同一主机、同一运行用户、同一应用和 daemon 下，保留原审批消费者，另用独立进程订阅 `im.message.receive_v1`，解码其 NDJSON 并调用本模块。共用 daemon 的兼容性仍需用测试应用验证，避免为同一应用在另一台主机或另一运行账户启动独立长连接。不能共享 daemon 时可评估为接单使用独立测试应用，届时须配置该应用对应的 Open ID。
-
-### 开启真实接单前
-
-1. 在隔离测试应用开启机器人能力，配置 `im.message.receive_v1` 长连接订阅和 `im:message.p2p_msg:readonly` 权限。准备稳定的应用和租户命名空间、该应用的允许 Open ID，以及仓库外的项目数据库。
-2. 接上消费进程和私聊回执，在同一个测试 daemon 上交错验证私聊登记、卡片审批和恢复。验证重连、消费者退出再启动后两类事件仍可到达，测试重投、拒绝路径及回执失败。消费者回执失败时可用原消息重试查询登记结果，回执发送自身也需要处理重复。
-3. 先上线登记和回执。今后单独接入执行时，以任务编号作为执行幂等键，实施领取和失败恢复机制，执行前重新验证工作目录。消息正文是用户输入，接入执行前需要定义审批与权限边界。
-
-共用 daemon 带来共同故障点。测试应关注新增订阅权限或应用发布是否影响现有审批、不同 daemon 是否分流事件，以及重连或缓冲区溢出时是否漏收。运行日志应避免记录私聊正文和凭据。本轮只运行模拟事件测试。
+上线前需用测试应用交错验证私聊登记和卡片点击，并在消费者重启后重复验证。共用 daemon 带来共同故障点，应确认断线和缓冲溢出时的漏收行为。同一应用在不同主机或账户上启动独立 daemon 时，事件可能分流。回执请求超时或发送成功后进程在写入成功标记前退出时，重投依赖 CLI 文档所述的一小时幂等窗口。本轮测试使用模拟 CLI 和 SQLite，真实消息、回执及审批共存仍需手动验收。
