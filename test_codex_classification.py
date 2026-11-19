@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_classification_backend import CodexClassificationBackend, DISABLED_FEATURES
+from feishu_live_bridge import main as live_main
 from feishu_natural_test_bridge import main
 from natural_language_classifier import NaturalLanguageClassifier, OUTPUT_SCHEMA
 from test_feishu_receiver import event
@@ -24,6 +26,27 @@ class CodexClassificationTests(unittest.TestCase):
             "--open-id", "ou_owner", "--namespace", "test-app.tenant", "--once",
             "--timeout", "20", "--model", "example-model", "--classification-timeout", "3",
         ]
+
+    @patch("feishu_live_bridge.run_bridge", return_value=0)
+    @patch("sys.argv", ["feishu_live_bridge.py"])
+    def test_live_entry_configures_classifier_only_when_enabled(self, run_bridge):
+        env = {
+            "FEISHU_DB_PATH": str(self.root / "live.sqlite3"),
+            "FEISHU_WORKSPACE": str(self.root),
+            "FEISHU_NAMESPACE": "test-app.tenant",
+            "FEISHU_ALLOWED_OPEN_IDS": "ou_owner",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(live_main(), 0)
+            bridge = run_bridge.call_args.args[0]
+            self.assertIsNone(bridge.receivers["ou_owner"].natural_router)
+
+            os.environ["FEISHU_NATURAL_LANGUAGE_ENABLED"] = "1"
+            os.environ["FEISHU_CODEX_HOME"] = str(self.home)
+            self.assertEqual(live_main(), 0)
+            bridge = run_bridge.call_args.args[0]
+            router = bridge.receivers["ou_owner"].natural_router
+            self.assertEqual(router.classifier.backend.codex_home, self.home)
 
     def mock_reply(self, command, **options):
         self.assertEqual(command[:4], ["codex", "-a", "never", "exec"])

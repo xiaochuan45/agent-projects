@@ -112,9 +112,13 @@ python3 -B feishu_live_bridge.py --once --timeout 120
 
 ### 自然语言接单（独立测试）
 
-常规桥接程序默认按原固定格式接单。独立入口 `feishu_natural_test_bridge.py` 将真实
-Codex 分类器注入同一个 `LiveBridge`。固定格式、澄清确认、已处理消息和未授权消息
-均跳过模型。分类器收到需求文本和原文提及的项目编号、名称及别名。遇到「刚刚那个项目」
+常规桥接程序默认按固定格式接单。设置 `FEISHU_NATURAL_LANGUAGE_ENABLED=1`，并将
+`FEISHU_CODEX_HOME` 指向单独认证的 Codex 登录目录，可让 `feishu_live_bridge.py`
+使用现有的飞书配置、SQLite 库和项目工作区处理自然语言消息。将开关设为 `0` 即可恢复固定格式接单。
+
+独立入口 `feishu_natural_test_bridge.py` 将真实 Codex 分类器注入同一个 `LiveBridge`。
+固定格式、澄清确认、已处理消息和未授权消息均跳过模型。
+分类器收到需求文本和原文提及的项目编号、名称及别名。遇到「刚刚那个项目」
 等上下文指代时，输入还包括最近确认的项目。路由仍用完整的测试项目库复核归属。
 
 - 示例「请新建报表助手项目，先实现 CSV 导出」和「给报表助手加导出设置」。

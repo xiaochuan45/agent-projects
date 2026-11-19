@@ -13,7 +13,9 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+from codex_classification_backend import CodexClassificationBackend
 from feishu_receiver import MESSAGE_EVENT, FeishuMessageReceiver, valid_message_id
+from natural_language_classifier import NaturalLanguageClassifier
 from natural_language_router import NaturalLanguageRouter
 from project_manager import ProjectManager
 
@@ -255,7 +257,10 @@ def main(*, classifier=None):
         if natural_language_enabled not in ("0", "1"):
             raise ValueError("FEISHU_NATURAL_LANGUAGE_ENABLED must be 0 or 1")
         if natural_language_enabled == "1" and classifier is None:
-            raise ValueError("natural language routing requires an injected classifier")
+            codex_home = os.environ["FEISHU_CODEX_HOME"]
+            if not codex_home.strip():
+                parser.error("FEISHU_CODEX_HOME must point to a separate Codex login")
+            classifier = NaturalLanguageClassifier(CodexClassificationBackend(codex_home))
         bridge = LiveBridge(
             ProjectManager(database, workspace), open_ids, namespace,
             natural_language_enabled=natural_language_enabled == "1", classifier=classifier,
