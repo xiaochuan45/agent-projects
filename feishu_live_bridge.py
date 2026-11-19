@@ -267,12 +267,16 @@ def main(*, classifier=None):
                   type(exc).__name__)
         return 2
 
+    return run_bridge(bridge, once=args.once, timeout=args.timeout)
+
+
+def run_bridge(bridge, *, once, timeout):
     def stop(_signum, _frame):
         bridge.stopping = True
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    return bridge.run(once=args.once, timeout=args.timeout)
+    return bridge.run(once=once, timeout=timeout)
 
 
 if __name__ == "__main__":

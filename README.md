@@ -112,12 +112,10 @@ python3 -B feishu_live_bridge.py --once --timeout 120
 
 ### 自然语言接单（独立测试）
 
-桥接程序默认按原固定格式接单。集成方可在独立测试进程中构造
-`LiveBridge(..., natural_language_enabled=True, classifier=NaturalLanguageClassifier(backend))`。
-`backend(prompt)` 返回 JSON 字符串，应由集成方实现超时和工具隔离。通过 Python 调用
-`main(classifier=...)` 时，可设置 `FEISHU_NATURAL_LANGUAGE_ENABLED=1` 启用；单独设置开关
-而未注入分类器会报配置错误。分类器只收到消息、项目编号/名称/别名与最近一次确认的项目编号。
-本分支不调用 Autoloop 派发任务。
+常规桥接程序默认按原固定格式接单。独立入口 `feishu_natural_test_bridge.py` 将真实
+Codex 分类器注入同一个 `LiveBridge`。固定格式、澄清确认、已处理消息和未授权消息
+均跳过模型。分类器收到需求文本和原文提及的项目编号、名称及别名。遇到「刚刚那个项目」
+等上下文指代时，输入还包括最近确认的项目。路由仍用完整的测试项目库复核归属。
 
 - 示例「请新建报表助手项目，先实现 CSV 导出」和「给报表助手加导出设置」。
   项目归属由代码用数据库复核，同时比对原文中的编号、名称或别名。模型建议的置信度
@@ -133,12 +131,12 @@ python3 -B feishu_live_bridge.py --once --timeout 120
   清理本次创建的空目录。工作区应由接单进程控制。进程被强杀或主机掉电时，目录可能
   已创建而 SQLite 尚未提交。维护时应先停写入，对照库里的项目目录人工核查孤立目录。
 - 回执沿用原桥接通道及幂等机制。自然语言路由仍是同步处理，占用单次监听循环的时间
-  取决于注入后端的超时。当前待确认请求没有过期清理，最近的确认项目也没有时间窗口。
+  取决于分类超时。当前待确认请求没有过期清理，最近的确认项目也没有时间窗口。
 
 在本仓库运行下面的命令可用模拟飞书事件、Mock 分类器和临时数据库离线联调。
 
 ```bash
-python3 -B -m unittest -v test_natural_language
+python3 -B -m unittest -v test_natural_language test_codex_classification
 ```
 
 如需手动验证真实 Codex 分类，在隔离的测试账户或容器里准备单独认证的 Codex 目录，
@@ -149,7 +147,28 @@ python3 -B classify_natural_language.py --codex-home /隔离的测试账户/code
   '请新建报表助手项目，先实现 CSV 导出'
 ```
 
-本机 `codex-cli 0.170.0` 帮助已核实非交互执行、Schema 文件、只读沙箱和最后消息输出
-选项。手动入口使用临时工作目录、受限继承环境、忽略用户配置和执行规则，并关闭已知的
-Shell、应用、插件和钩子功能。只读沙箱控制模型命令的写权限，用户认证依旧由测试 Codex
-目录提供。工具与凭据的完整隔离仍需在实际运行环境验证，因此 CLI 适配器只用于人工测试。
+两种测试入口共用 `codex exec` 后端。默认使用 Codex CLI 的默认模型，可通过
+`--model MODEL_ID` 选择测试账号可用且支持 low 推理和结构化输出的模型。
+分类固定传入 `model_reasoning_effort="low"`，默认超时 45 秒，可用
+`--classification-timeout SECONDS` 调整。模型失败、超时或输出不合格时返回分类失败，
+项目和任务均不登记。日志仅记录运行状态、耗时和 CLI JSONL 提供的数字用量统计。
+
+真实飞书单次联调需要单独的测试应用及 `lark-cli` profile，并在 Git 仓库外准备一个
+专用私有目录，其中的 `codex-home` 需在隔离测试账户或容器内单独登录。测试入口会在该
+目录内创建 `nl-test.sqlite3` 和 `workspace`。使用同一目录和命名空间再次运行，
+可处理上一次的澄清确认。建议用权限为 0700 的专用目录。
+
+```bash
+python3 -B feishu_natural_test_bridge.py --once --timeout 120 \
+  --state-dir /隔离测试目录 --lark-profile nl-test \
+  --namespace test-app.test-tenant --open-id ou_REPLACE_WITH_TEST_OPEN_ID
+```
+
+等出现 `Feishu consumer ready` 后，向测试机器人发送一条虚构开发需求。该入口可读取测试
+应用的授权私聊、发送回执、登记本地测试任务与创建测试项目目录。入口没有 Autoloop 派发
+或项目执行路径。等待超时计算到开始处理消息，分类及发送各有自己的超时。
+
+本机 Codex CLI 0.170.0 的帮助与功能列表已通过离线检查。后端使用临时工作目录、只读沙箱、
+禁止审批、限制子进程环境、忽略用户配置和执行规则，关闭 Shell 工具、网页搜索、应用、
+插件和钩子等功能。真实账号可用模型、服务端用量事件、工具隔离和测试应用收发仍需在隔离
+环境人工验收。真实请求会把分类输入传给模型服务，联调请使用虚构数据。

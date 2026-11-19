@@ -32,6 +32,14 @@ def _looks_like_name(name):
                 and not any(char in name for char in "/\\\n\r\x00"))
 
 
+def _project_references(text, projects):
+    folded = text.casefold()
+    numbers = {reference.upper() for reference in NUMBER.findall(folded)}
+    mentioned = {project.number for project in projects
+                 if any(_mentioned(folded, name) for name in (project.name, *project.aliases))}
+    return numbers, mentioned
+
+
 class NaturalLanguageRouter:
     def __init__(self, manager, classifier):
         self.manager = manager
@@ -58,11 +66,16 @@ class NaturalLanguageRouter:
         elif not text or len(text) > 4000:
             result = {"status": "invalid_natural_text"}
         else:
+            numbers, mentioned = _project_references(text, projects)
+            references = numbers | mentioned
+            contextual = bool(CONTEXT.search(text))
+            if last_project is not None and contextual:
+                references.add(last_project)
             try:
                 suggestion = self.classifier.classify(text, [
                     {"number": p.number, "name": p.name, "aliases": p.aliases}
-                    for p in projects
-                ], last_project)
+                    for p in projects if p.number in references
+                ], last_project if contextual else None)
             except Exception:
                 # Transport failures and malformed output both fail closed.
                 result = {"status": "classification_failed"}
@@ -111,9 +124,7 @@ class NaturalLanguageRouter:
         projects = self.manager._list_projects(db)
         by_number = {project.number: project for project in projects}
         folded = text.casefold()
-        explicit = {reference.upper() for reference in NUMBER.findall(folded)}
-        mentioned = {p.number for p in projects
-                     if any(_mentioned(folded, name) for name in (p.name, *p.aliases))}
+        explicit, mentioned = _project_references(text, projects)
         candidates = (explicit & by_number.keys()) | mentioned
         unknown_number = bool(explicit - by_number.keys()) or (
             suggestion.project_number is not None and suggestion.project_number not in by_number

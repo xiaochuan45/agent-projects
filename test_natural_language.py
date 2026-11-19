@@ -75,6 +75,8 @@ class NaturalLanguageTests(unittest.TestCase):
                 self.assertEqual((result["status"], result["project_number"]), ("registered", "P001"))
         prompt = self.backend.call_args.args[0]
         self.assertIn("甲方", prompt)
+        self.assertNotIn("Beta", prompt)
+        self.assertNotIn("乙方", prompt)
         self.assertNotIn(str(self.workspace), prompt)
 
     def test_ambiguous_confirmation_is_scoped_persistent_and_atomic(self):
